@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import socket
 import statistics
@@ -584,6 +585,20 @@ def _free_local_port():
         return listener.getsockname()[1]
 
 
+def _default_child_wall_seconds():
+    """Default serve-child wall timeout.
+
+    ROCm cold starts can spend much longer in first-run compile and graph warmup
+    than CUDA runs; keep a larger default there to avoid false timeout kills.
+    """
+    override = os.environ.get("JSPP_CHILD_WALL_SECONDS")
+    if override is not None:
+        return float(override)
+    if shutil.which("rocm-smi"):
+        return 45 * 60
+    return 18 * 60
+
+
 def _run_child_with_rank_watch(command, environment, *, wall_timeout=18 * 60):
     """Bound rank pipe waits, including when the parent exits before its ranks."""
     child = subprocess.Popen(command, env=environment, text=True,
@@ -636,7 +651,10 @@ def _run_child_with_rank_watch(command, environment, *, wall_timeout=18 * 60):
             if exited_at is not None and now - exited_at >= 0.75:
                 return stop("child exited while rank held output pipe", partial)
             if now - started >= wall_timeout:
-                return stop("serve child wall timeout", partial)
+                return stop(
+                    f"serve child wall timeout ({now - started:.1f}s >= {wall_timeout:.1f}s)",
+                    partial,
+                )
 
 
 def validate_method_placement(method, placement):
@@ -1521,13 +1539,30 @@ def _resolve_draft_snapshot(recipe, cache):
 
 
 def _gpu_uuid(device):
-    return subprocess.check_output([
-        "nvidia-smi", "-i", device, "--query-gpu=uuid", "--format=csv,noheader"],
-        text=True, timeout=30).strip()
+    if shutil.which("nvidia-smi"):
+        return subprocess.check_output([
+            "nvidia-smi", "-i", device, "--query-gpu=uuid", "--format=csv,noheader"],
+            text=True, timeout=30).strip()
+    if shutil.which("rocm-smi"):
+        output = subprocess.check_output(
+            ["rocm-smi", "--showuniqueid", "--json"],
+            text=True,
+            timeout=30,
+        )
+        payload = json.loads(output)
+        key = device if str(device).startswith("card") else f"card{int(device)}"
+        card = payload.get(key, {})
+        unique = str(card.get("Unique ID", "")).strip()
+        if not unique:
+            raise RuntimeError(
+                f"missing Unique ID for {key} in rocm-smi output"
+            )
+        return unique
+    raise FileNotFoundError("neither nvidia-smi nor rocm-smi is available")
 
 
 def _gpu_uuids(devices, *, required=True):
-    """Device identities; ``required=False`` (--resolve-only) records None where nvidia-smi is absent."""
+    """Device identities; ``required=False`` (--resolve-only) records None where GPU SMI tooling is absent."""
     try:
         return [_gpu_uuid(device) for device in devices]
     except (OSError, subprocess.SubprocessError):
@@ -1537,31 +1572,140 @@ def _gpu_uuids(devices, *, required=True):
 
 
 def _gpu_census(uuids, allowed_pids=()):
-    gpu_output = subprocess.check_output([
-        "nvidia-smi",
-        "--query-gpu=index,uuid,memory.used,utilization.gpu,utilization.memory",
-        "--format=csv,noheader"], text=True, timeout=30)
-    app_output = subprocess.check_output([
-        "nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory,process_name",
-        "--format=csv,noheader"], text=True, timeout=30)
+    def _pid_is_live(pid):
+        """Best-effort host liveness check for ROCm-reported PIDs.
+
+        Some ROCm stacks can report stale or namespace-foreign process IDs in
+        --showpidgpus/--showpids. Treat those as advisory and do not hard-block
+        local runs on them.
+        """
+        try:
+            status = Path("/proc") / str(int(pid)) / "status"
+            text = status.read_text()
+        except (OSError, ValueError):
+            return False
+        for line in text.splitlines():
+            if line.startswith("State:"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] in ("Z", "X"):
+                    return False
+                break
+        return True
+
     gpus = []
-    for line in gpu_output.splitlines():
-        fields = [field.strip() for field in line.split(",")]
-        if len(fields) != 5:
-            raise RuntimeError(f"malformed GPU census row: {line!r}")
-        gpus.append({
-            "index": int(fields[0]), "uuid": fields[1], "used_memory": fields[2],
-            "gpu_utilization": fields[3], "memory_utilization": fields[4],
-        })
     applications = []
-    for line in app_output.splitlines():
-        fields = [field.strip() for field in line.split(",", 3)]
-        if len(fields) != 4:
-            raise RuntimeError(f"malformed compute-app census row: {line!r}")
-        applications.append({
-            "gpu_uuid": fields[0], "pid": int(fields[1]),
-            "used_memory": fields[2], "process_name": fields[3],
-        })
+    if shutil.which("nvidia-smi"):
+        gpu_output = subprocess.check_output([
+            "nvidia-smi",
+            "--query-gpu=index,uuid,memory.used,utilization.gpu,utilization.memory",
+            "--format=csv,noheader"], text=True, timeout=30)
+        app_output = subprocess.check_output([
+            "nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory,process_name",
+            "--format=csv,noheader"], text=True, timeout=30)
+        for line in gpu_output.splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 5:
+                raise RuntimeError(f"malformed GPU census row: {line!r}")
+            gpus.append({
+                "index": int(fields[0]), "uuid": fields[1], "used_memory": fields[2],
+                "gpu_utilization": fields[3], "memory_utilization": fields[4],
+            })
+        for line in app_output.splitlines():
+            fields = [field.strip() for field in line.split(",", 3)]
+            if len(fields) != 4:
+                raise RuntimeError(f"malformed compute-app census row: {line!r}")
+            applications.append({
+                "gpu_uuid": fields[0], "pid": int(fields[1]),
+                "used_memory": fields[2], "process_name": fields[3],
+            })
+    elif shutil.which("rocm-smi"):
+        gpu_output = subprocess.check_output(
+            ["rocm-smi", "--showid", "--showmemuse", "--showuse", "--showuniqueid", "--json"],
+            text=True,
+            timeout=30,
+        )
+        payload = json.loads(gpu_output)
+        index_to_uuid: dict[int, str] = {}
+        for key, entry in payload.items():
+            if not str(key).startswith("card"):
+                continue
+            index = int(str(key).replace("card", ""))
+            uuid = str(entry.get("Unique ID", "")).strip()
+            index_to_uuid[index] = uuid
+            gpus.append({
+                "index": index,
+                "uuid": uuid,
+                "used_memory": str(entry.get("GPU Memory Allocated (VRAM%)", "")),
+                "gpu_utilization": str(entry.get("GPU use (%)", "")),
+                "memory_utilization": str(entry.get("GPU Memory Read/Write Activity (%)", "")),
+            })
+        # ROCm-SMI JSON process rows are not stable across environments and can report
+        # logical GPU ids. The text form of --showpidgpus has stable physical indices.
+        app_output = subprocess.check_output(
+            ["rocm-smi", "--showpidgpus"],
+            text=True,
+            timeout=30,
+        )
+        pid_to_memory: dict[int, str] = {}
+        try:
+            pids_json_output = subprocess.check_output(
+                ["rocm-smi", "--showpids", "--json"],
+                text=True,
+                timeout=30,
+            )
+            match = re.search(r"\{.*\}", pids_json_output, flags=re.DOTALL)
+            if match:
+                app_payload = json.loads(match.group(0))
+                # Example:
+                # {"system": {"PID123": "unknown, 1, 25395277824, 518580, 0"}}
+                for pid_key, detail in (app_payload.get("system") or {}).items():
+                    pid_digits = re.sub(r"[^0-9]", "", str(pid_key))
+                    if not pid_digits:
+                        continue
+                    detail_parts = [part.strip() for part in str(detail).split(",")]
+                    pid_to_memory[int(pid_digits)] = (
+                        detail_parts[2] if len(detail_parts) >= 3 else ""
+                    )
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            pass
+        current_pid = None
+        for line in app_output.splitlines():
+            match = re.search(r"PID\s+(\d+)\s+is using\s+\d+\s+DRM device\(s\):", line)
+            if match:
+                current_pid = int(match.group(1))
+                continue
+            if current_pid is None:
+                continue
+            indices = [int(value) for value in re.findall(r"\d+", line)]
+            if not indices:
+                continue
+            for gpu_index in indices:
+                applications.append({
+                    "gpu_uuid": index_to_uuid.get(gpu_index),
+                    "pid": current_pid,
+                    "used_memory": pid_to_memory.get(current_pid, ""),
+                    "process_name": "unknown",
+                })
+    else:
+        raise FileNotFoundError("neither nvidia-smi nor rocm-smi is available")
+    # Keep only host-visible live PIDs and valid GPU UUID mappings, then dedupe
+    # noisy ROCm rows before occupancy checks.
+    filtered = []
+    seen = set()
+    for app in applications:
+        gpu_uuid = app.get("gpu_uuid")
+        pid = app.get("pid")
+        if not gpu_uuid:
+            continue
+        if not _pid_is_live(pid):
+            continue
+        key = (gpu_uuid, int(pid))
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(app)
+    applications = filtered
+
     allowed = {int(pid) for pid in allowed_pids}
     other_applications = [app for app in applications if app["pid"] not in allowed]
     occupied = [app for app in other_applications if app["gpu_uuid"] in uuids]
@@ -2471,8 +2615,11 @@ def _parser():
                         help="target sampling temperature (draft remains greedy)")
     parser.add_argument("--seed", type=int, default=0, help="sampling seed")
     parser.add_argument("--repeats", type=int, default=1)
-    parser.add_argument("--child-wall-seconds", type=float, default=18 * 60,
-                        help="wall-clock cap on one serve child before SIGTERM (default 18 min)")
+    parser.add_argument("--child-wall-seconds", type=float,
+                        default=_default_child_wall_seconds(),
+                        help=("wall-clock cap on one serve child before SIGTERM "
+                              "(default: 45 min on ROCm, 18 min otherwise; "
+                              "override with JSPP_CHILD_WALL_SECONDS)"))
     parser.add_argument("--passes", type=int,
                         help="drafter passes; when supplied, must match the named recipe")
     parser.add_argument("--sweep-rows-cap", type=int, choices=(2, 4, 8, 16),

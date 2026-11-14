@@ -5,21 +5,36 @@ from jetspec.engines.jetspec_plus_plus._optional import flashinfer
 
 from jetspec.engines.jetspec_plus_plus.models.sampling import apply_sampler_x_rescaling
 
-# Monkey-patch flashinfer 0.5.2 bug: get_seed_and_offset builds state on CPU
-# but generator is on CUDA, causing TypeError: RNG state must be a torch.ByteTensor.
-from jetspec.engines.jetspec_plus_plus._optional import sampling as _fi_samp
-_orig_get_seed_and_offset = _fi_samp.get_seed_and_offset
-def _fixed_get_seed_and_offset(increment, generator=None, device=None):
-    if generator is None:
-        device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        generator = torch.Generator(device=device)
-    state = generator.get_state()
-    seed, offset = state.view(torch.int64)
-    offset += (increment + 3) // 4 * 4
-    new_state = torch.tensor([seed, offset], dtype=torch.int64, device=state.device).view(torch.uint8)
-    generator.set_state(new_state)
-    return int(seed), int(offset)
-_fi_samp.get_seed_and_offset = _fixed_get_seed_and_offset
+def _flashinfer_sampling_available() -> bool:
+    try:
+        version = getattr(flashinfer, "__version__", None)
+        sampling_from_logits = getattr(flashinfer, "sampling_from_logits", None)
+        return isinstance(version, str) and callable(sampling_from_logits)
+    except Exception:
+        return False
+
+
+FLASHINFER_SAMPLING = _flashinfer_sampling_available()
+
+
+if FLASHINFER_SAMPLING:
+    # Monkey-patch flashinfer 0.5.2 bug: get_seed_and_offset builds state on CPU
+    # but generator is on CUDA, causing TypeError: RNG state must be a torch.ByteTensor.
+    from jetspec.engines.jetspec_plus_plus._optional import sampling as _fi_samp
+    _orig_get_seed_and_offset = _fi_samp.get_seed_and_offset
+
+    def _fixed_get_seed_and_offset(increment, generator=None, device=None):
+        if generator is None:
+            device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            generator = torch.Generator(device=device)
+        state = generator.get_state()
+        seed, offset = state.view(torch.int64)
+        offset += (increment + 3) // 4 * 4
+        new_state = torch.tensor([seed, offset], dtype=torch.int64, device=state.device).view(torch.uint8)
+        generator.set_state(new_state)
+        return int(seed), int(offset)
+
+    _fi_samp.get_seed_and_offset = _fixed_get_seed_and_offset
 
 torch.manual_seed(0) 
 
@@ -53,9 +68,18 @@ class Sampler(nn.Module):
         zero_mask = temperatures == 0
         safe_temps = torch.where(zero_mask, torch.ones_like(temperatures), temperatures)
         scaled = logits.to(torch.float).div_(safe_temps.unsqueeze(-1))
-        sample_tokens = flashinfer.sampling_from_logits(
-            scaled, generator=self._get_gen(scaled.device)
-        ).to(torch.int64)
+        if FLASHINFER_SAMPLING:
+            sample_tokens = flashinfer.sampling_from_logits(
+                scaled, generator=self._get_gen(scaled.device)
+            ).to(torch.int64)
+        else:
+            probs = torch.softmax(scaled, dim=-1, dtype=torch.float)
+            sample_tokens = torch.multinomial(
+                probs,
+                num_samples=1,
+                replacement=True,
+                generator=self._get_gen(scaled.device),
+            ).squeeze(-1).to(torch.int64)
         if zero_mask.any():
             greedy_tokens = logits.float().argmax(dim=-1)
             sample_tokens = torch.where(zero_mask, greedy_tokens, sample_tokens)

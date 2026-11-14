@@ -176,10 +176,15 @@ def compact_head(hidden, weight, ids, storage=None, *, persistent=False):
         # consume its packed prefix with the same, smaller chunk stride.
         persistent = False
         grid = (triton.cdiv(rows, bm), chunks)
+    hip = bool(getattr(torch.version, "hip", None))
+    bk = 32 if hip else 64
+    stages = 2 if hip else 4
+    if hip:
+        warps = min(warps, 2)
     _compact_head[grid](
         hidden if logits is None else logits, weight, ids, *partials, rows, vocab, width, *weight.stride(),
-        slots, chunks, bm, bn, 64, PERSISTENT=persistent,
-        FROM_LOGITS=logits is not None, num_warps=warps, num_stages=4)
+        slots, chunks, bm, bn, bk, PERSISTENT=persistent,
+        FROM_LOGITS=logits is not None, num_warps=warps, num_stages=stages)
     _compact_merge[(rows,)](*partials, *outputs, chunks,
                            triton.next_power_of_2(chunks), num_warps=4)
     return outputs

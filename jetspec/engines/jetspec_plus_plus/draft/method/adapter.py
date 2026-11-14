@@ -491,8 +491,13 @@ def resolve_ctxkv_head_config(config, *, training=False, validate=None) -> dict:
             raise ValueError("target q heads must be divisible by kv heads")
         if not isinstance(target.get("attn_output_gate", False), bool):
             raise ValueError("target_text_config.attn_output_gate must be boolean")
+        default_rope_theta = getattr(config, "rope_theta", None)
+        if default_rope_theta is None:
+            default_rope_theta = (getattr(config, "rope_parameters", {}) or {}).get(
+                "rope_theta", 1000000.0
+            )
         rope = target.get("rope_parameters") or dict(
-            rope_type="default", rope_theta=target.get("rope_theta", config.rope_theta),
+            rope_type="default", rope_theta=target.get("rope_theta", default_rope_theta),
             partial_rotary_factor=target.get("partial_rotary_factor", 1.0))
         if not isinstance(rope, dict) or rope.get("rope_type") != "default":
             raise ValueError("target_text_config requires default rope_parameters")
@@ -747,7 +752,14 @@ class CtxKVC1Stream(nn.Module):
         rotary_config = copy.deepcopy(config)
         rope = target.get("rope_parameters", {})
         rotary_config.head_dim = self.attention_spec.rotary_dim
-        rotary_config.rope_theta = target.get("rope_theta", rope.get("rope_theta", config.rope_theta))
+        default_rope_theta = getattr(config, "rope_theta", None)
+        if default_rope_theta is None:
+            default_rope_theta = (getattr(config, "rope_parameters", {}) or {}).get(
+                "rope_theta", 1000000.0
+            )
+        rotary_config.rope_theta = target.get(
+            "rope_theta", rope.get("rope_theta", default_rope_theta)
+        )
         rotary_config.rope_scaling = None if rope else getattr(config, "rope_scaling", None)
         def norm_class(dim, eps):
             return RMSNorm(dim, eps, norm_offset=self.attention_spec.norm_offset,

@@ -128,11 +128,16 @@ def head_partials(hidden, weight, partials):
     chunks = partials[0].shape[-1]
     from jetspec.engines.jetspec_plus_plus.models.target_linear import w4a8_head_logits
     logits = w4a8_head_logits(hidden, weight)
+    # ROCm kernels have a tighter shared-memory ceiling; shrink BK/stages there.
+    hip = bool(getattr(torch.version, "hip", None))
+    bk = 32 if hip else 64
+    warps = 2 if hip else 4
+    stages = 2 if hip else 4
     _head[(triton.cdiv(rows * lanes, 64), chunks)](
         flat if logits is None else logits, weight, *partials, rows * lanes, vocab, width,
-        *flat.stride(), *weight.stride(), chunks, 64, VOCAB_TILE, 64,
+        *flat.stride(), *weight.stride(), chunks, 64, VOCAB_TILE, bk,
         FROM_LOGITS=logits is not None, TOKEN_IDS=token_ids,
-        REDUCED=reduced is not None, num_warps=4, num_stages=4)
+        REDUCED=reduced is not None, num_warps=warps, num_stages=stages)
 
 
 def head_top1(hidden, weight, partials, token, p_top1):

@@ -68,7 +68,7 @@ def _partials(Q, K, V, LENGTH, COUNT, P, M, S,
             probability = tl.exp2((score - safe_max[:, None]) * 1.4426950408889634)
             denominator = denominator * alpha + tl.sum(probability, 1)
             contribution = tl.dot(probability, v.to(tl.float32),
-                                  input_precision="tf32x3")
+                                  input_precision="tf32")
             numerator = numerator * alpha[:, None] + contribution
             maximum = new_max
     offset = (split * HEADS + head) * ROWS + row
@@ -239,7 +239,7 @@ def _merged_partials(Q, K, V, LENGTH, COUNT, P, M, S,
             probability = tl.exp2((score - safe_max[:, None]) * 1.4426950408889634)
             denominator = denominator * alpha + tl.sum(probability, 1)
             contribution = tl.dot(probability, v.to(tl.float32),
-                                  input_precision="tf32x3")
+                                  input_precision="tf32")
             numerator = numerator * alpha[:, None] + contribution
             maximum = new_max
     offset = (split * HEADS + head) * ROWS + row

@@ -9,6 +9,7 @@ from __future__ import annotations
 from jetspec.engines.jetspec_plus_plus.profiles import kernel_enabled, kernel_value
 
 import os
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +26,110 @@ except ImportError:  # Triton is Linux/CUDA-only in the pinned environment.
 
 
 _NORM_EXTENSION = None
+
+
+def _c1_extension_cuda_flags(*, disable_fmad: bool = True):
+    """Return JIT extension flags compatible with CUDA and ROCm backends."""
+    flags = ["-O3"]
+    # NVCC accepts this parity flag; HIP clang rejects it.
+    if disable_fmad and not getattr(torch.version, "hip", None):
+        flags.append("--fmad=false")
+    return flags
+
+
+class _RocmNormFallback:
+    __file__ = "<jetspec_rocm_norm_fallback>"
+
+    @staticmethod
+    def rms_norm(input, weight, eps):
+        return _reference_rms_norm(input, weight, eps)
+
+
+class _RocmLoopFallback:
+    __file__ = "<jetspec_rocm_loop_fallback>"
+
+    @staticmethod
+    def d1_lean_loop(*_args, **_kwargs):
+        # Trigger the existing Python fallback in drafter._lean_loop.
+        raise RuntimeError("needs the Triton rotary entries")
+
+    @staticmethod
+    def q_norm_rotary(projected_q, qn_w, cos, sin, q_out, tokens, heads, qn_eps):
+        projected = projected_q if projected_q.dim() == 3 else projected_q.view(1, tokens, -1)
+        cos_view = cos if cos.dim() == 3 else cos.unsqueeze(0)
+        sin_view = sin if sin.dim() == 3 else sin.unsqueeze(0)
+        output = q_norm_rotary(
+            sys.modules[__name__], projected, qn_w, cos_view, sin_view,
+            qn_eps, heads, q_out.shape[-1]
+        )
+        q_out.copy_(output)
+        return q_out
+
+    @staticmethod
+    def k_norm_rotary_cache(projected_key, projected_value, kn_w, cos, sin,
+                            key_out, value_out, tokens, kv_heads, groups, kn_eps,
+                            window_slots=None):
+        del window_slots
+        dim = key_out.shape[-1]
+        key_input = projected_key if projected_key.dim() == 3 else projected_key.view(1, tokens, -1)
+        value_input = projected_value if projected_value.dim() == 3 else projected_value.view(1, tokens, -1)
+        cos_view = cos if cos.dim() == 3 else cos.unsqueeze(0)
+        sin_view = sin if sin.dim() == 3 else sin.unsqueeze(0)
+        key, value = fast_kv_postprocess(
+            key_input, value_input, kn_w, cos_view, sin_view, kn_eps, kv_heads, groups, dim
+        )
+        key_out.copy_(key[0].transpose(0, 1))
+        value_out.copy_(value[0].transpose(0, 1))
+        return key_out, value_out
+
+    @staticmethod
+    def qk_norm_rotary_cache(projected_q, projected_key, projected_value, qn_w, kn_w,
+                             cos, sin, q_out, key_out, value_out, tokens, heads,
+                             kv_heads, groups, qn_eps, kn_eps, window_slots, _warps,
+                             **kwargs):
+        del kwargs
+        _RocmLoopFallback.q_norm_rotary(
+            projected_q, qn_w, cos, sin, q_out, tokens, heads, qn_eps
+        )
+        _RocmLoopFallback.k_norm_rotary_cache(
+            projected_key, projected_value, kn_w, cos[0], sin[0], key_out, value_out,
+            tokens, kv_heads, groups, kn_eps, window_slots
+        )
+
+    @staticmethod
+    def rms_norm_wide_rows(window, kv_weights, kv_eps):
+        rows, width = window.shape
+        return (torch.stack([
+            _reference_rms_norm(window, weight, kv_eps)
+            for weight in kv_weights
+        ]) if len(kv_weights) else window.new_empty((0, rows, width)))
+
+
+class _RocmLeanOpsFallback:
+    __file__ = "<jetspec_rocm_lean_ops_fallback>"
+
+    @staticmethod
+    def add_rms_norm(update, residual, weight, eps):
+        return fast_add_rms_norm(update, residual, weight, eps)
+
+    @staticmethod
+    def ew_offset_norm(input, update, residual, window, weight, kv_weight,
+                       eps, kv_eps, pending, kv_from_state, reduction_threads):
+        del reduction_threads
+        state = residual + update if pending else input
+        rows, width = state.shape
+        kv_input = state if kv_from_state else window
+        sources = (torch.stack([
+            _reference_rms_norm(kv_input, block_weight, kv_eps, 1, "after_weight")
+            for block_weight in kv_weight
+        ]) if len(kv_weight) else input.new_empty((0, rows, width)))
+        normalized = _reference_rms_norm(state, weight, eps, 1, "after_weight")
+        return normalized, state, sources
+
+
+_ROCM_NORM_FALLBACK = _RocmNormFallback()
+_ROCM_LOOP_FALLBACK = _RocmLoopFallback()
+_ROCM_LEAN_OPS_FALLBACK = _RocmLeanOpsFallback()
 
 
 def resolve_c1_qk_warps(tokens, *, run_config=None):
@@ -146,6 +251,8 @@ torch::Tensor c1_rms_norm_cuda(torch::Tensor input, torch::Tensor weight, double
 
 
 def _norm_extension():
+    if getattr(torch.version, "hip", None):
+        return _ROCM_NORM_FALLBACK
     global _NORM_EXTENSION
     if _NORM_EXTENSION is None:
         from torch.utils.cpp_extension import load_inline
@@ -154,7 +261,7 @@ def _norm_extension():
             cpp_sources=_NORM_CPP,
             cuda_sources=_NORM_CUDA,
             extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3", "--fmad=false"],
+            extra_cuda_cflags=_c1_extension_cuda_flags(),
             with_cuda=True,
             verbose=False,
         )
@@ -339,6 +446,8 @@ torch::Tensor c1_rms_norm_cuda(torch::Tensor input, torch::Tensor weight, double
 
 
 def _wide_norm_extension():
+    if getattr(torch.version, "hip", None):
+        return _ROCM_NORM_FALLBACK
     global _WIDE_NORM_EXTENSION
     if _WIDE_NORM_EXTENSION is None:
         from torch.utils.cpp_extension import load_inline
@@ -347,7 +456,7 @@ def _wide_norm_extension():
             cpp_sources=_NORM_CPP,
             cuda_sources=_WIDE_NORM_CUDA,
             extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3", "--fmad=false"],
+            extra_cuda_cflags=_c1_extension_cuda_flags(),
             with_cuda=True,
             verbose=False,
         )
@@ -1091,6 +1200,8 @@ torch::Tensor c1_silu_mul_cuda(torch::Tensor gate, torch::Tensor up) {
 
 
 def _lean_ops_extension():
+    if getattr(torch.version, "hip", None):
+        return _ROCM_LEAN_OPS_FALLBACK
     global _LEAN_OPS_EXTENSION
     if _LEAN_OPS_EXTENSION is None:
         from torch.utils.cpp_extension import load_inline
@@ -1099,7 +1210,7 @@ def _lean_ops_extension():
             cpp_sources=_LEAN_OPS_CPP,
             cuda_sources=_LEAN_OPS_CUDA,
             extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3", "--fmad=false"],
+            extra_cuda_cflags=_c1_extension_cuda_flags(),
             with_cuda=True,
             verbose=False,
         )
@@ -1282,7 +1393,8 @@ def ew_pre_norm(u: torch.Tensor, window: torch.Tensor, input_weight: torch.Tenso
                 for block, weight in enumerate(kv_weights)])
             sources = torch.cat((appended, sources), dim=1)
         return _reference_rms_norm(state, input_weight, input_eps, norm_offset, rounding), state, sources
-    if norm_offset == 1 and width == 5120 and append is None and not ulp:
+    if (norm_offset == 1 and width == 5120 and append is None and not ulp
+            and not getattr(torch.version, "hip", None)):
         update, residual = (u, u) if pending is None else pending
         return _lean_ops_extension().ew_offset_norm(
             u, update, residual, window, input_weight, kv_weights, input_eps, kv_eps,
@@ -1344,6 +1456,10 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         from jetspec.engines.jetspec_plus_plus.kernels.nvfp4.producers import enabled, rms_norm as produce
         if enabled(x):
             return produce(x, weight, eps)
+    # The C++ extension kernels below are CUDA-specific; HIP builds fail on
+    # NV-only intrinsics and warp-mask signatures. Use the portable path on ROCm.
+    if getattr(torch.version, "hip", None):
+        return _reference_rms_norm(x, weight, eps)
     if (x.device.type != "cuda" or x.dtype == torch.float32
             or not (x.shape[-1] == 128 or x.shape[-1] % 128 == 0)):
         return _reference_rms_norm(x, weight, eps)
@@ -2802,6 +2918,8 @@ def _torch_cublas_ldflags():
 
 
 def _loop_extension():
+    if getattr(torch.version, "hip", None):
+        return _ROCM_LOOP_FALLBACK
     global _LOOP_EXTENSION
     if _LOOP_EXTENSION is None:
         from torch.utils.cpp_extension import load_inline
@@ -2811,7 +2929,7 @@ def _loop_extension():
             cuda_sources=_LOOP_CUDA,
             extra_cflags=["-O3"],
             # the certified norm's flags (JETSPEC_C1_ROPE_NORM replays its arithmetic)
-            extra_cuda_cflags=["-O3", "--fmad=false"],
+            extra_cuda_cflags=_c1_extension_cuda_flags(),
             extra_ldflags=_torch_cublas_ldflags(),
             with_cuda=True,
             verbose=False,

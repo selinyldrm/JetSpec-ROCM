@@ -2,6 +2,7 @@
 import importlib
 import importlib.util
 from importlib import metadata
+import os
 import torch
 
 
@@ -49,9 +50,20 @@ class _Language(_Deferred):
 
 def optional(name):
     if importlib.util.find_spec(name.split('.')[0]) is not None:
-        return importlib.import_module(name)
+        try:
+            return importlib.import_module(name)
+        except Exception:
+            # Some environments have partially installed accelerator packages
+            # (e.g., stale editable paths). Fall back to deferred imports so
+            # non-accelerated backends can still run.
+            return _Deferred(name)
     return _Deferred(name)
 
+
+if getattr(torch.version, "hip", None):
+    # ROCm wheels can ship Triton below AITER's strict gluon floor. The ROCm
+    # backend docs explicitly allow system Triton via this env gate.
+    os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
 
 try:
     triton = importlib.import_module('triton')

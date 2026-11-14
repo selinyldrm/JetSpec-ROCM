@@ -350,7 +350,7 @@ class TargetRunner(ModelRunner):
                     kv_last_page_len=torch.empty(1, dtype=torch.int32,
                                                  device="cpu", pin_memory=True),
                 )
-            if self._verify_plan_lean_enabled:
+            if self._verify_plan_lean_enabled and ATTENTION_BACKEND == "flashinfer":
                 self._jetspec_n1_plan_wrappers = {}
                 self._jetspec_n1_plan_kwargs = {}
                 for query_width, plan_host in self._jetspec_n1_plan_host.items():

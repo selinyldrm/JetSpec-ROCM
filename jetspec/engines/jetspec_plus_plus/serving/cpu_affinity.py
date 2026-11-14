@@ -1,7 +1,9 @@
 """Rank-local CPU placement for serving. Auto skips each NUMA node's first 12 CPUs."""
+import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 
@@ -39,9 +41,30 @@ def parse_cpu_ranges(spec, ranks):
 
 
 def gpu_pci_bus_id(uuid):
-    bus = subprocess.check_output([
-        "nvidia-smi", "-i", uuid, "--query-gpu=pci.bus_id", "--format=csv,noheader"],
-        text=True, timeout=30).strip().lower()
+    if shutil.which("nvidia-smi"):
+        bus = subprocess.check_output([
+            "nvidia-smi", "-i", uuid, "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+            text=True, timeout=30).strip().lower()
+    elif shutil.which("rocm-smi"):
+        payload = json.loads(
+            subprocess.check_output(
+                ["rocm-smi", "--showbus", "--showuniqueid", "--json"],
+                text=True,
+                timeout=30,
+            )
+        )
+        bus = None
+        for entry in payload.values():
+            if not isinstance(entry, dict):
+                continue
+            unique = str(entry.get("Unique ID", "")).strip().lower()
+            if unique == str(uuid).strip().lower():
+                bus = str(entry.get("PCI Bus", "")).strip().lower()
+                break
+        if not bus:
+            raise ValueError(f"no PCI bus found for ROCm GPU UUID {uuid!r}")
+    else:
+        raise FileNotFoundError("neither nvidia-smi nor rocm-smi is available")
     if not re.fullmatch(r"[0-9a-f]{4,8}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", bus):
         raise ValueError(f"invalid GPU PCI bus ID: {bus!r}")
     return bus[-12:]

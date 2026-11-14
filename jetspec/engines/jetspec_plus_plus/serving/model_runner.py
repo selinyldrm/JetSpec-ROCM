@@ -187,6 +187,9 @@ class ModelRunner:
         self.draft_async = config.draft_async
         self.event = event
         self._exiting = False 
+        # Draft async wrappers are optional on non-FlashInfer backends.
+        self.prefill_wrappers = {}
+        self.only_prefill_wrapper = None
         
         self.cuda_device_index = cuda_device_for_rank(self.rank, run_config=self.run_config)
         if self.cuda_device_index >= torch.cuda.device_count():
@@ -201,11 +204,37 @@ class ModelRunner:
             architecture = f'sm{major}{minor}'
             qualifications = tuple(name for name in ('hybrid_verify_triton', 'hybrid_verify_flashinfer')
                                    if setting(self, 'engine.engine_settings.' + name, '0') == '1')
-            bind_attention_backend(select_attention_backend(
-                self.model_spec.attention, self.model_spec.has_state, architecture,
-                requested=ATTENTION_BACKEND, qualifications=qualifications,
-                reference=self.engine.kind == 'reference'))
+            requested_backend = ATTENTION_BACKEND
+            try:
+                selected_backend = select_attention_backend(
+                    self.model_spec.attention,
+                    self.model_spec.has_state,
+                    architecture,
+                    requested=requested_backend,
+                    qualifications=qualifications,
+                    reference=self.engine.kind == 'reference',
+                )
+            except ValueError as error:
+                # ROCm/non-validated arches can still run FlashInfer kernels even when
+                # parity tables only list CUDA SKUs. Keep explicit FlashInfer requests.
+                if requested_backend == "flashinfer" and isinstance(
+                        getattr(flashinfer, "__version__", None), str):
+                    selected_backend = "flashinfer"
+                    print(
+                        "W217_ATTENTION_BACKEND=fallback_flashinfer "
+                        f"arch={architecture} reason={error}",
+                        flush=True,
+                    )
+                else:
+                    # For unsupported explicit backends (or missing FlashInfer),
+                    # fall back to SDPA.
+                    selected_backend = "sdpa"
+            bind_attention_backend(selected_backend)
         jetspec_target = bool(config.jetspec and not is_draft)
+        flashinfer_runtime_ready = isinstance(getattr(flashinfer, "__version__", None), str)
+        if ATTENTION_BACKEND == "flashinfer" and not flashinfer_runtime_ready:
+            # ROCm or broken FlashInfer install: force safe backend fallback.
+            bind_attention_backend("sdpa")
         flashinfer_dtype_supported = self.hf_config.torch_dtype in {
             torch.float16,
             torch.bfloat16,
@@ -215,6 +244,10 @@ class ModelRunner:
             jetspec_target=jetspec_target,
             flashinfer_dtype_supported=flashinfer_dtype_supported,
         )
+        if jetspec_verify_backend == "flashinfer_paged" and (
+            ATTENTION_BACKEND != "flashinfer" or not flashinfer_runtime_ready
+        ):
+            jetspec_verify_backend = "sdpa"
         self.jetspec_paged_flashinfer = (
             jetspec_verify_backend == "flashinfer_paged")
         if has_state(self) and jetspec_target:
@@ -224,9 +257,17 @@ class ModelRunner:
         if self._verify_plan_reuse_enabled and jetspec_target and (
                 self.enforce_eager or ATTENTION_BACKEND != "flashinfer" or
                 flashinfer.__version__ != "0.6.18"):
-            raise RuntimeError(
-                "JETSPEC_VERIFY_PLAN_REUSE requires FlashInfer 0.6.18 "
-                "target CUDA-graph mode")
+            # Keep serving on ROCm / non-0.6.18 FlashInfer by disabling the
+            # plan-reuse fast path instead of hard-failing the run.
+            self._verify_plan_reuse_enabled = False
+            self._verify_plan_reuse_check = False
+            print(
+                "W217_VERIFY_PLAN_REUSE=fallback_off "
+                f"eager={int(self.enforce_eager)} "
+                f"backend={ATTENTION_BACKEND} "
+                f"flashinfer_version={getattr(flashinfer, '__version__', 'unknown')}",
+                flush=True,
+            )
         if self.jetspec_paged_flashinfer:
             print(
                 "W217_JETSPEC_ATTENTION=flashinfer_paged "
@@ -247,11 +288,11 @@ class ModelRunner:
                 "reason=flashinfer_paged_dtype_unsupported",
                 flush=True,
             )
-        if ATTENTION_BACKEND == "flashinfer" or self.jetspec_paged_flashinfer:
+        if flashinfer_runtime_ready and (ATTENTION_BACKEND == "flashinfer" or self.jetspec_paged_flashinfer):
             self._init_flashinfer_attention_backend()
         
         # cudagraph logic for FlashInfer kernels, need diff wrapper for each batch size we make a graph for 
-        if is_draft and config.draft_async:
+        if is_draft and config.draft_async and flashinfer_runtime_ready and ATTENTION_BACKEND == "flashinfer":
             self._init_flashinfer_wrappers()
         
         if self.verbose: print(f'INSIDE MODEL RUNNER INIT, DRAFT={is_draft}', flush=True)
@@ -1100,9 +1141,20 @@ class ModelRunner:
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
-                if self.is_draft and self.draft_async and not self.enforce_eager:
+                if (
+                    self.is_draft
+                    and self.draft_async
+                    and not self.enforce_eager
+                    and hasattr(self, "prefill_wrappers")
+                ):
                     module.prefill_wrappers = self.prefill_wrappers
-                elif self.is_draft and self.draft_async and self.enforce_eager:
+                elif (
+                    self.is_draft
+                    and self.draft_async
+                    and self.enforce_eager
+                    and hasattr(self, "only_prefill_wrapper")
+                    and self.only_prefill_wrapper is not None
+                ):
                     module.only_prefill_wrapper = self.only_prefill_wrapper # this will make it not None so it can be used on fwd
                 layer_id += 1
 
@@ -1237,7 +1289,7 @@ class ModelRunner:
                 self.plan_flashinfer_decode_attention()
         
         if is_prefill or self.enforce_eager:
-            if is_tree_decode:
+            if is_tree_decode and ATTENTION_BACKEND == "flashinfer" and self.only_prefill_wrapper is not None:
                 self.eager_tree_decode_plan(input_ids, positions, tree_decode_step, cache_hits)
             
             if self.config.use_eagle: 

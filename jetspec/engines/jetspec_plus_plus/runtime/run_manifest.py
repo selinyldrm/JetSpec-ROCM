@@ -271,6 +271,11 @@ def package_versions(names=PACKAGES, distributions=DISTRIBUTIONS, *, run_config=
             versions[name] = str(getattr(importlib.import_module(name), "__version__", "unknown"))
         except ImportError:
             versions[name] = "absent"
+        except Exception:
+            # Some environments carry a partially broken module install path;
+            # treat this as unavailable for manifest sealing instead of failing
+            # the whole benchmark after decoding completed.
+            versions[name] = "unavailable"
     for name, (candidates, module) in distributions.items():
         versions[name] = _distribution_version(candidates, module)
     with _lock:
