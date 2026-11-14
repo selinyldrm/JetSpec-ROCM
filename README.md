@@ -1,1 +1,1 @@
-Adaptation of JetSpec++ to ROCM and AMD GPUs. Run inside the following container with ROCM-compatible FlashInfer installation: seliny2/selin-ssd https://hub.docker.com/repository/docker/seliny2/selin-ssd/general
+Adaptation of JetSpec++ to ROCM and AMD MI300x GPUs. Run inside the following container with ROCM-compatible FlashInfer installation: seliny2/selin-ssd https://hub.docker.com/repository/docker/seliny2/selin-ssd/general
