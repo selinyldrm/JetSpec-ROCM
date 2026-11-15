@@ -1239,28 +1239,29 @@ class BucketRowDraftHead(RowDraftHead):
         self.contexts=torch.zeros(N*(prefix_bucket+self.T),head.fc.in_features,
                                   device=self.device,dtype=self.dtype)
         self.prepare(layout,self.contexts)
+        self._refresh_inject_lean2_enabled = False
         if refresh and kernel_enabled('refresh_inject_lean2', '1'):
             from jetspec.engines.jetspec_plus_plus.runtime.profile import enabled as profile_enabled
             supported_widths = (16, 32) if profile_enabled() else (16,)
-            if N != 1 or self.B not in supported_widths:
-                raise ValueError('REFRESH_INJECT_LEAN2 requires N=1 fixed 16-slot refresh (32 in eval)')
-            if self.device.type == 'cuda' and self.dtype != torch.bfloat16:
-                raise ValueError('REFRESH_INJECT_LEAN2 requires BF16 drafter weights')
-            from jetspec.engines.jetspec_plus_plus.draft.refresh_inject import prepare
-            prepare(head)
-            self._refresh_inject_storage = torch.stack(self.kv)
-            self.kv = _context_kv_views(self._refresh_inject_storage, run_config=self.run_config)
-            if self._context_graph is not None:
-                # prepare() captured the old cache addresses; rebuild after
-                # installing the shared allocation used by the inject writer.
-                self._context_graph = None
-                self.refresh_context(self.contexts)
+            if N == 1 and self.B in supported_widths:
+                if self.device.type == 'cuda' and self.dtype != torch.bfloat16:
+                    raise ValueError('REFRESH_INJECT_LEAN2 requires BF16 drafter weights')
+                from jetspec.engines.jetspec_plus_plus.draft.refresh_inject import prepare
+                prepare(head)
+                self._refresh_inject_storage = torch.stack(self.kv)
+                self.kv = _context_kv_views(self._refresh_inject_storage, run_config=self.run_config)
+                if self._context_graph is not None:
+                    # prepare() captured the old cache addresses; rebuild after
+                    # installing the shared allocation used by the inject writer.
+                    self._context_graph = None
+                    self.refresh_context(self.contexts)
+                self._refresh_inject_lean2_enabled = True
         # The measured short bucket uses one kernel. The separate SKV27 knob
         # bypasses this bucket limit and the hybrid profile's J-pass exclusion.
-        self._jpass_len_enabled = (backend == 'flashinfer' and
+        self._jpass_len_enabled = (backend == 'flashinfer' and self.B == 16 and
                                    kernel_enabled('jpass_attn_len', '1') and
                                    layout.num_kv // N <= 768)
-        self._jpass_skv27_enabled = (backend == 'flashinfer' and N == 1
+        self._jpass_skv27_enabled = (backend == 'flashinfer' and self.B == 16 and N == 1
                                      and kernel_enabled('draft_fuse_skv27', '1'))
         if self._jpass_len_enabled or self._jpass_skv27_enabled:
             self._jpass_state = SimpleNamespace(lengths=None)
@@ -1784,7 +1785,7 @@ class BucketRowDraftHead(RowDraftHead):
         head, rows = self.head, self.N * self.R * self.B
         if tuple(hidden.shape[:2]) != (self.N * self.R, self.B):
             raise ValueError(f'refresh entries must be [N*R,{self.B},hidden]')
-        if kernel_enabled('refresh_inject_lean2', '1'):
+        if self._refresh_inject_lean2_enabled:
             if (self.N != 1 or not fixed_layout or entries is not None or
                     config_values(self.run_config).get('engine.engine_settings.refresh_inject_inclusive', '0') != '1'):
                 raise ValueError('REFRESH_INJECT_LEAN2 requires N=1 fixed INCLUSIVE refresh')

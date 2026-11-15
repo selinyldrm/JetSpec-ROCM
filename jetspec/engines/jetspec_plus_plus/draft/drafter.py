@@ -2208,9 +2208,18 @@ class ServingCtxKVC1Head(CtxKVC1Head):
         cos, sin = cos.contiguous(), sin.contiguous()
         if window_slots is not None:
             keys_total = mask.shape[-1]
-            if (tuple(mask.shape[:3]) != (1, 1, Q) or keys_total % 16
+            if (tuple(mask.shape[:3]) != (1, 1, Q)
                     or mask.dtype != embeddings.dtype or tuple(window_slots.shape) != (Q,)):
                 raise ValueError("C1 LEAN live layout requires a [1,1,Q,16k] float mask")
+            if keys_total % 16:
+                aligned = ((keys_total + 15) // 16) * 16
+                cache_width = int(self._c1_kv[0][0].shape[2])
+                if aligned > cache_width:
+                    raise ValueError("C1 LEAN live layout mask alignment exceeds cache width")
+                padded = embeddings.new_zeros((1, 1, Q, aligned))
+                padded[..., :keys_total].copy_(mask)
+                mask = padded
+                keys_total = aligned
         else:
             keys_total = length + Q
         if mask is None:
@@ -3069,12 +3078,12 @@ class ServingCtxKVC1Head(CtxKVC1Head):
         attributes the query steps read (each graph was captured on its own set)."""
         sets = self._c1_window_sets
         if Q not in sets:
-            if Q in (16, 32):
+            if Q in (8, 16, 32):
                 base = sets[15]
                 sets[Q] = {name: base[name].new_empty(1, Q, base[name].shape[-1])
                            for name in ("_c1_embeddings", "_c1_qcos", "_c1_qsin", "_c1_output")}
             else:
-                raise ValueError("C1 GRAPH_LAYOUT=live takes a 15-, 16- or 32-row window")
+                raise ValueError("C1 GRAPH_LAYOUT=live takes an 8-, 15-, 16- or 32-row window")
         for name, value in sets[Q].items():
             setattr(self, name, value)
         return sets[Q], ("" if Q == 15 else f"w{Q}")
@@ -5285,8 +5294,8 @@ def bind_front_inputs(drafter, decoder, capacity, run_config=None):
         raise ValueError("front chain requires the served C1 cache head")
     head._front_embed_tokens = drafter.embed_tokens
     width = draft_width(run_config=run_config)
-    if width not in (15, 31):
-        raise ValueError("front chain requires 15 or 31 pending drafts")
+    if width not in (7, 15, 31):
+        raise ValueError("front chain requires 7, 15 or 31 pending drafts")
     lanes = width + 1
     device, dtype = drafter.device, drafter.dtype
     hidden = decoder.hidden_size
@@ -5302,8 +5311,9 @@ def bind_front_inputs(drafter, decoder, capacity, run_config=None):
     window, _ = head._c1_window_set(lanes)
     c1_embeddings = window["_c1_embeddings"]
     staged_hidden = window["_c1_output"]
-    taps = head._c1_dirty[0].view(lanes, 5, hidden)
-    positions = head._c1_dirty_positions
+    # Graph init may have provisioned a larger lane buffer (e.g. 16); slice to active lanes.
+    taps = head._c1_dirty[0, :lanes].view(lanes, 5, hidden)
+    positions = head._c1_dirty_positions[:, :lanes]
     c1_top = head._c1_capacity + lanes
     key_bucket = config_values(run_config).get('engine.engine_settings.chain_c1_key_bucket', "0") == "1"
     c1_bucket = (c1_top if head._c1_capacity > 768 and not key_bucket else

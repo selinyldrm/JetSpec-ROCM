@@ -286,7 +286,12 @@ def _cache_rows_k3(draft_ids, offers_ids, offers_p64, offers_pack, dec_logits,
     lanes = offers_ids.shape[0]
     if (draft_ids.numel() != lanes - 1 or lanes not in ((16, 32) if fill_zero else (16,))
             or R not in (4, 8, 16)):
-        raise ValueError('K3 rows require b16 (b32 in eval) and R=4,8,16')
+        # K3 kernel is specialized for b16/b32; use the method oracle for other widths.
+        return reference('cache_rows_chain')(
+            draft_ids, offers_ids, offers_p64, offers_pack, dec_logits, p_top1_prev, R,
+            coefficients=coefficients, miss=miss, tau_idx=tau_idx, correction=correction,
+            tau_table=tau_table, temperature=temperature, out=out,
+            previous_mass16=previous_mass16, floor=floor, fill_zero=fill_zero, control=control)
     if decoder_frame != 'wire':
         raise ValueError('K3 rows require the chain wire decoder frame')
     blend_dec = len(coefficients) == 6

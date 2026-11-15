@@ -430,8 +430,8 @@ def build_served_entry(key: ChainKey, *, rows, tokens, tap_store, row_ring,
     from jetspec.engines.jetspec_plus_plus.draft.live_rows import rows_chain_body
     from jetspec.engines.jetspec_plus_plus.draft.live_rows import rows_chain_home_words
 
-    if key.lanes not in (16, 32) or key.R not in (4, 8, 16):
-        raise ValueError("served pair chain requires b16/b32 and r4/r8/r16")
+    if key.lanes not in (8, 16, 32) or key.R not in (4, 8, 16):
+        raise ValueError("served pair chain requires b8/b16/b32 and r4/r8/r16")
     drafter = rows.drafter
     decoder = rows.decoder
     if decoder is None:

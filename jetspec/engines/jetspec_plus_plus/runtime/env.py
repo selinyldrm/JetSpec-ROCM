@@ -174,6 +174,11 @@ def inert_requirements(environ, *, jetspec=True):
         if (rule.name == _name('engine', 'engine_settings.chain_graph') and rule.flag == _name('engine', 'engine_settings.jetspec_verify_device')
                 and environ.get(_name('engine', 'engine_settings.verify_reference'), "0") == "1"):
             continue
+        if (rule.name == _name('engine', 'engine_settings.front_static')
+                and rule.flag == _name('method', 'method_settings.drafts')
+                and environ.get(_name('method', 'method_settings.drafts')) == "7"):
+            # Allow draft-7 experiments with the static front chain.
+            continue
         if (rule.name == _name('engine', 'engine_settings.pair_outcome_push')
                 and rule.flag in (_name('engine', 'engine_settings.jetspec_verify_device'), _name('engine', 'engine_settings.outcome_pack_presync'))
                 and environ.get(_name('engine', 'engine_settings.verify_reference'), "0") == "1"):
@@ -483,8 +488,8 @@ def validate_environment(environ=None, *, jetspec=True, max_num_seqs=1, warn=pri
             problems.append("JETSPEC_CHAIN_GRAPH=seg requires N=1")
         if _name('engine', 'engine_settings.rows_fused') in environ:
             problems.append("JETSPEC_CHAIN_GRAPH=seg requires JETSPEC_ROWS_FUSED unset")
-        if environ.get(_name('method', 'method_settings.drafts')) not in ("15", "31"):
-            problems.append("JETSPEC_CHAIN_GRAPH=seg requires JETSPEC_DRAFTS=15 or 31")
+        if environ.get(_name('method', 'method_settings.drafts')) not in ("7", "15", "31"):
+            problems.append("JETSPEC_CHAIN_GRAPH=seg requires JETSPEC_DRAFTS=7, 15 or 31")
         if (environ.get(_name('engine', 'engine_settings.hybrid_pair')) == "1"
                 and width == 32
                 and environ.get(_name('engine', 'engine_settings.rows_k3')) == "1"):
